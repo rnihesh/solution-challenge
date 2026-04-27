@@ -7,7 +7,7 @@ importScripts('https://www.gstatic.com/firebasejs/10.7.1/firebase-messaging-comp
 
 // Initialize the Firebase app in the service worker
 firebase.initializeApp({
-  apiKey: 'REDACTED',
+  apiKey: 'REPLACE_WITH_FIREBASE_API_KEY',
   authDomain: 'civiclemma.firebaseapp.com',
   projectId: 'civiclemma',
   storageBucket: 'civiclemma.firebasestorage.app',

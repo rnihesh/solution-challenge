@@ -57,7 +57,7 @@ class WhisperConfig(BaseModel):
 
 class WeatherConfig(BaseModel):
     """Google Weather API configuration"""
-    api_key: str = os.getenv("GOOGLE_MAPS_API_KEY", "REDACTED")
+    api_key: str = os.getenv("GOOGLE_MAPS_API_KEY", "")
     base_url: str = "https://weather.googleapis.com/v1"
 
     @property
