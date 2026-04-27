@@ -1,0 +1,39 @@
+{
+  "name": "civiclemma",
+  "version": "1.0.0",
+  "description": "Civic Issue Reporting and Municipal Accountability Platform for India",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\" \"npm run dev:ml\" \"npm run dev:agent\"",
+    "dev:server": "cd server && npm run dev",
+    "dev:client": "cd client && npm run dev",
+    "dev:ml": "node scripts/python-service.mjs dev ml",
+    "dev:agent": "node scripts/python-service.mjs dev agent",
+    "build": "npm run build:server && npm run build:client",
+    "build:server": "cd server && npm run build",
+    "build:client": "cd client && npm run build",
+    "start:server": "cd server && npm start",
+    "start:client": "cd client && npm start",
+    "start:ml": "node scripts/python-service.mjs start ml",
+    "start:agent": "node scripts/python-service.mjs start agent",
+    "install:all": "npm install && cd server && npm install && cd ../client && npm install",
+    "install:ml": "node scripts/python-service.mjs install ml",
+    "install:agent": "node scripts/python-service.mjs install agent",
+    "clean": "rm -rf node_modules && cd server && rm -rf node_modules dist && cd ../client && rm -rf node_modules .next"
+  },
+  "keywords": [
+    "civic",
+    "municipality",
+    "governance",
+    "transparency",
+    "india"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
