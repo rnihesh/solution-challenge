@@ -7,8 +7,42 @@
 import { Router, Request, Response } from "express";
 import { getAdminDb, COLLECTIONS } from "../shared/firebase";
 import { mlService } from "../services/ml";
+import {
+  buildCacheKey,
+  getCacheTtlSeconds,
+  getOrSetCachedJson,
+  normalizeBoundsForCache,
+} from "../services/cache";
 
 const router = Router();
+const clusterCacheTtlSeconds = getCacheTtlSeconds(
+  "ML_CLUSTER_CACHE_TTL_SECONDS",
+  60
+);
+
+function parseBounds(value: any) {
+  if (!value) {
+    return null;
+  }
+
+  const north = Number(value.north);
+  const south = Number(value.south);
+  const east = Number(value.east);
+  const west = Number(value.west);
+
+  if (
+    !Number.isFinite(north) ||
+    !Number.isFinite(south) ||
+    !Number.isFinite(east) ||
+    !Number.isFinite(west) ||
+    north < south ||
+    east < west
+  ) {
+    return null;
+  }
+
+  return { north, south, east, west };
+}
 
 /**
  * POST /api/ml/cluster
@@ -16,75 +50,105 @@ const router = Router();
  */
 router.post("/cluster", async (req: Request, res: Response) => {
   try {
-    const { eps_meters, min_samples, bounds, municipalityId, status } = req.body;
+    const { eps_meters, min_samples, bounds, municipalityId, status } =
+      req.body;
+    const parsedBounds = parseBounds(bounds);
 
-    // Build query for issues
-    const db = getAdminDb();
-    let query = db.collection(COLLECTIONS.ISSUES).limit(500);
-
-    if (municipalityId) {
-      query = query.where("municipalityId", "==", municipalityId);
-    }
-
-    if (status) {
-      query = query.where("status", "==", status);
-    }
-
-    // Fetch issues
-    const snapshot = await query.get();
-    const issues: Array<{
-      id: string;
-      location: { latitude: number; longitude: number };
-      type?: string;
-      severity?: number;
-    }> = [];
-
-    snapshot.forEach((doc) => {
-      const data = doc.data();
-      if (data.location?.latitude && data.location?.longitude) {
-        // Filter by bounds if provided
-        if (bounds) {
-          const lat = data.location.latitude;
-          const lng = data.location.longitude;
-          if (
-            lat < bounds.south ||
-            lat > bounds.north ||
-            lng < bounds.west ||
-            lng > bounds.east
-          ) {
-            return;
-          }
-        }
-
-        issues.push({
-          id: doc.id,
-          location: {
-            latitude: data.location.latitude,
-            longitude: data.location.longitude,
-          },
-          type: data.type,
-          severity: data.priority_score,
-        });
-      }
-    });
-
-    // Call ML service
-    const result = await mlService.clusterIssues(issues, {
-      eps_meters,
-      min_samples,
-    });
-
-    if (!result.success) {
-      return res.status(500).json({
+    if (bounds && !parsedBounds) {
+      return res.status(400).json({
         success: false,
-        error: result.error,
+        error: "Invalid bounds",
         timestamp: new Date().toISOString(),
       });
     }
 
+    const cacheBounds = parsedBounds
+      ? normalizeBoundsForCache(parsedBounds)
+      : null;
+    const cacheKey = buildCacheKey([
+      "ml",
+      "cluster",
+      eps_meters || "default",
+      min_samples || "default",
+      municipalityId || "all",
+      status || "all",
+      cacheBounds?.south,
+      cacheBounds?.north,
+      cacheBounds?.west,
+      cacheBounds?.east,
+    ]);
+
+    const clusterData = await getOrSetCachedJson(
+      cacheKey,
+      clusterCacheTtlSeconds,
+      async () => {
+        // Build query for issues
+        const db = getAdminDb();
+        let query = db.collection(COLLECTIONS.ISSUES).limit(500);
+
+        if (municipalityId) {
+          query = query.where("municipalityId", "==", municipalityId);
+        }
+
+        if (status) {
+          query = query.where("status", "==", status);
+        }
+
+        // Fetch issues
+        const snapshot = await query.get();
+        const issues: Array<{
+          id: string;
+          location: { latitude: number; longitude: number };
+          type?: string;
+          severity?: number;
+        }> = [];
+
+        snapshot.forEach((doc) => {
+          const data = doc.data();
+          if (data.location?.latitude && data.location?.longitude) {
+            // Filter by bounds if provided
+            if (cacheBounds) {
+              const lat = data.location.latitude;
+              const lng = data.location.longitude;
+              if (
+                lat < cacheBounds.south ||
+                lat > cacheBounds.north ||
+                lng < cacheBounds.west ||
+                lng > cacheBounds.east
+              ) {
+                return;
+              }
+            }
+
+            issues.push({
+              id: doc.id,
+              location: {
+                latitude: data.location.latitude,
+                longitude: data.location.longitude,
+              },
+              type: data.type,
+              severity: data.priority_score,
+            });
+          }
+        });
+
+        // Call ML service
+        const result = await mlService.clusterIssues(issues, {
+          eps_meters,
+          min_samples,
+        });
+
+        if (!result.success) {
+          throw new Error(result.error || "Clustering failed");
+        }
+
+        return result.data;
+      }
+    );
+
     return res.json({
       success: true,
-      data: result.data,
+      data: clusterData,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {

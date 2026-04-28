@@ -32,16 +32,52 @@ import type {
 import { createIssueBudgetEstimate } from "../shared/budget";
 import { sendNewIssueNotification } from "../services/notifications";
 import { buildIssueSla } from "../shared/sla";
+import {
+  buildCacheKey,
+  getCacheTtlSeconds,
+  getOrSetCachedJson,
+  normalizeBoundsForCache,
+} from "../services/cache";
 
 const router: IRouter = Router();
 
-// Cache to prevent Firestore quota exhaustion for frequent polling
-interface CacheEntry<T> {
-  data: T;
-  timestamp: number;
+const issueListCacheTtlSeconds = getCacheTtlSeconds(
+  "ISSUES_CACHE_TTL_SECONDS",
+  60
+);
+const issueStatsCacheTtlSeconds = getCacheTtlSeconds(
+  "ISSUE_STATS_CACHE_TTL_SECONDS",
+  60
+);
+const issueMapCacheTtlSeconds = getCacheTtlSeconds(
+  "ISSUE_MAP_CACHE_TTL_SECONDS",
+  60
+);
+
+function parseFiniteNumber(value: unknown): number | null {
+  const parsed = Number.parseFloat(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
 }
-const cacheExpiryMs = 60000; // 60 seconds
-const issuesCache = new Map<string, CacheEntry<any[]>>();
+
+function parseMapBounds(query: Request["query"]) {
+  const north = parseFiniteNumber(query.north);
+  const south = parseFiniteNumber(query.south);
+  const east = parseFiniteNumber(query.east);
+  const west = parseFiniteNumber(query.west);
+
+  if (
+    north === null ||
+    south === null ||
+    east === null ||
+    west === null ||
+    north < south ||
+    east < west
+  ) {
+    return null;
+  }
+
+  return { north, south, east, west };
+}
 
 function toDateValue(value: any): Date | null {
   if (!value) {
@@ -174,44 +210,47 @@ router.get("/", async (req: Request, res: Response) => {
 
     const hasStatusFilter = filters.status && filters.status.length > 0;
     const hasTypeFilter = filters.type && filters.type.length > 0;
-    
+
     // Due to Firestore composite index requirements, we'll fetch all and filter in memory
-    const cacheKey = `issues-${filters.municipalityId || "all"}`;
-    const now = Date.now();
-    let issues = [] as any[];
+    const cacheKey = buildCacheKey([
+      "issues",
+      "list",
+      filters.municipalityId || "all",
+    ]);
 
-    if (issuesCache.has(cacheKey) && (now - issuesCache.get(cacheKey)!.timestamp < cacheExpiryMs)) {
-      issues = issuesCache.get(cacheKey)!.data;
-    } else {
-      let query: FirebaseFirestore.Query = db.collection(COLLECTIONS.ISSUES)
-        .orderBy("createdAt", "desc");
-      
-      if (filters.municipalityId) {
-        query = query.where("municipalityId", "==", filters.municipalityId);
+    let issues = await getOrSetCachedJson<any[]>(
+      cacheKey,
+      issueListCacheTtlSeconds,
+      async () => {
+        let query: FirebaseFirestore.Query = db
+          .collection(COLLECTIONS.ISSUES)
+          .orderBy("createdAt", "desc");
+
+        if (filters.municipalityId) {
+          query = query.where("municipalityId", "==", filters.municipalityId);
+        }
+
+        // Fetch a larger batch to allow for filtering
+        const snapshot = await query.limit(100).get();
+
+        return snapshot.docs
+          .map((doc) => serializeIssueDocument(doc))
+          .filter(Boolean) as any[];
       }
+    );
 
-      // Fetch a larger batch to allow for filtering
-      const snapshot = await query.limit(100).get();
-
-      issues = snapshot.docs
-        .map((doc) => serializeIssueDocument(doc))
-        .filter(Boolean) as any[];
-      
-      issuesCache.set(cacheKey, { data: issues, timestamp: now });
-    }
-    
     // Apply filters in memory
     if (hasStatusFilter) {
       issues = issues.filter((issue) => filters.status!.includes(issue.status));
     }
-    
+
     if (hasTypeFilter) {
       issues = issues.filter((issue) => filters.type!.includes(issue.type));
     }
 
     // Get total count for the filtered results
     const total = issues.length;
-    
+
     // Apply pagination
     const offset = (page - 1) * pageSize;
     const paginatedIssues = issues.slice(offset, offset + pageSize);
@@ -243,44 +282,41 @@ router.get("/", async (req: Request, res: Response) => {
 // Get global stats (public) - must be before /:id to avoid route conflicts
 router.get("/stats", async (_req: Request, res: Response) => {
   try {
-    const cacheKey = "global-stats";
-    const now = Date.now();
-    let statsData;
+    const cacheKey = buildCacheKey(["issues", "stats", "global"]);
+    const statsData = await getOrSetCachedJson(
+      cacheKey,
+      issueStatsCacheTtlSeconds,
+      async () => {
+        const db = getAdminDb();
 
-    if (issuesCache.has(cacheKey) && (now - issuesCache.get(cacheKey)!.timestamp < cacheExpiryMs)) {
-      statsData = issuesCache.get(cacheKey)!.data;
-    } else {
-      const db = getAdminDb();
+        // Get total issues count
+        const totalSnapshot = await db.collection(COLLECTIONS.ISSUES).count().get();
+        const totalIssues = totalSnapshot.data().count;
 
-      // Get total issues count
-      const totalSnapshot = await db.collection(COLLECTIONS.ISSUES).count().get();
-      const totalIssues = totalSnapshot.data().count;
+        // Get resolved issues count (CLOSED status)
+        const resolvedSnapshot = await db
+          .collection(COLLECTIONS.ISSUES)
+          .where("status", "==", "CLOSED")
+          .count()
+          .get();
+        const resolvedIssues = resolvedSnapshot.data().count;
 
-      // Get resolved issues count (CLOSED status)
-      const resolvedSnapshot = await db
-        .collection(COLLECTIONS.ISSUES)
-        .where("status", "==", "CLOSED")
-        .count()
-        .get();
-      const resolvedIssues = resolvedSnapshot.data().count;
+        // Get municipalities count
+        const municipalitiesSnapshot = await db
+          .collection(COLLECTIONS.MUNICIPALITIES)
+          .count()
+          .get();
+        const totalMunicipalities = municipalitiesSnapshot.data().count;
 
-      // Get municipalities count
-      const municipalitiesSnapshot = await db
-        .collection(COLLECTIONS.MUNICIPALITIES)
-        .count()
-        .get();
-      const totalMunicipalities = municipalitiesSnapshot.data().count;
-
-      statsData = {
-        totalIssues,
-        resolvedIssues,
-        openIssues: totalIssues - resolvedIssues,
-        totalMunicipalities,
-        avgResponseTime: 48, // This would need more complex calculation
-      };
-
-      issuesCache.set(cacheKey, { data: statsData, timestamp: now });
-    }
+        return {
+          totalIssues,
+          resolvedIssues,
+          openIssues: totalIssues - resolvedIssues,
+          totalMunicipalities,
+          avgResponseTime: 48, // This would need more complex calculation
+        };
+      }
+    );
 
     res.json({
       success: true,
@@ -297,6 +333,72 @@ router.get("/stats", async (_req: Request, res: Response) => {
       success: false,
       data: null,
       error: "Failed to fetch stats",
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Get issues by bounds (for map)
+router.get("/map/bounds", async (req: Request, res: Response) => {
+  try {
+    const db = getAdminDb();
+    const bounds = parseMapBounds(req.query);
+
+    if (!bounds) {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: "Invalid or missing bounds parameters",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const cacheBounds = normalizeBoundsForCache(bounds);
+    const cacheKey = buildCacheKey([
+      "issues",
+      "map",
+      cacheBounds.south,
+      cacheBounds.north,
+      cacheBounds.west,
+      cacheBounds.east,
+    ]);
+
+    const issues = await getOrSetCachedJson<any[]>(
+      cacheKey,
+      issueMapCacheTtlSeconds,
+      async () => {
+        const snapshot = await db
+          .collection(COLLECTIONS.ISSUES)
+          .where("location.latitude", ">=", cacheBounds.south)
+          .where("location.latitude", "<=", cacheBounds.north)
+          .limit(500)
+          .get();
+
+        return snapshot.docs
+          .map((doc) => serializeIssueDocument(doc))
+          .filter(Boolean)
+          .filter((issue) => {
+            const lng = (issue as any).location?.longitude;
+            return lng >= cacheBounds.west && lng <= cacheBounds.east;
+          }) as any[];
+      }
+    );
+
+    res.json({
+      success: true,
+      data: issues,
+      error: null,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error(
+      "Error fetching map issues:",
+      error?.message || String(error)
+    );
+    res.status(500).json({
+      success: false,
+      data: null,
+      error: "Failed to fetch map issues",
       timestamp: new Date().toISOString(),
     });
   }
@@ -334,58 +436,6 @@ router.get("/:id", async (req: Request, res: Response) => {
       success: false,
       data: null,
       error: "Failed to fetch issue",
-      timestamp: new Date().toISOString(),
-    });
-  }
-});
-
-// Get issues by bounds (for map)
-router.get("/map/bounds", async (req: Request, res: Response) => {
-  try {
-    const db = getAdminDb();
-    const { north, south, east, west } = req.query;
-
-    if (!north || !south || !east || !west) {
-      return res.status(400).json({
-        success: false,
-        data: null,
-        error: "Missing bounds parameters",
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    const snapshot = await db
-      .collection(COLLECTIONS.ISSUES)
-      .where("location.latitude", ">=", parseFloat(south as string))
-      .where("location.latitude", "<=", parseFloat(north as string))
-      .limit(500)
-      .get();
-
-    const issues = snapshot.docs
-      .map((doc) => serializeIssueDocument(doc))
-      .filter(Boolean)
-      .filter((issue) => {
-        const lng = (issue as any).location?.longitude;
-        return (
-          lng >= parseFloat(west as string) && lng <= parseFloat(east as string)
-        );
-      });
-
-    res.json({
-      success: true,
-      data: issues,
-      error: null,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error: any) {
-    console.error(
-      "Error fetching map issues:",
-      error?.message || String(error)
-    );
-    res.status(500).json({
-      success: false,
-      data: null,
-      error: "Failed to fetch map issues",
       timestamp: new Date().toISOString(),
     });
   }

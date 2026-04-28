@@ -11,63 +11,67 @@ import type {
   LeaderboardEntry,
 } from "../shared/types";
 import { authMiddleware, AuthenticatedRequest } from "../middleware/auth";
+import {
+  buildCacheKey,
+  getCacheTtlSeconds,
+  getOrSetCachedJson,
+} from "../services/cache";
 
 const router: IRouter = Router();
 
-// Cache to prevent Firestore quota exhaustion for frequent polling
-interface CacheEntry<T> {
-  data: T;
-  timestamp: number;
-}
-const cacheExpiryMs = 60000; // 60 seconds
-const municipalitiesCache = new Map<string, CacheEntry<any>>();
+const municipalityCacheTtlSeconds = getCacheTtlSeconds(
+  "MUNICIPALITIES_CACHE_TTL_SECONDS",
+  300
+);
 
 // Get leaderboard (public)
 router.get("/leaderboard", async (req: Request, res: Response) => {
   try {
     const { page, pageSize } = paginationSchema.parse(req.query);
-    const cacheKey = `leaderboard-${page}-${pageSize}`;
-    const now = Date.now();
-    let responseData;
+    const cacheKey = buildCacheKey([
+      "municipalities",
+      "leaderboard",
+      page,
+      pageSize,
+    ]);
+    const responseData = await getOrSetCachedJson(
+      cacheKey,
+      municipalityCacheTtlSeconds,
+      async () => {
+        const db = getAdminDb();
+        const snapshot = await db
+          .collection(COLLECTIONS.MUNICIPALITIES)
+          .orderBy("score", "desc")
+          .limit(pageSize)
+          .offset((page - 1) * pageSize)
+          .get();
 
-    if (municipalitiesCache.has(cacheKey) && (now - municipalitiesCache.get(cacheKey)!.timestamp < cacheExpiryMs)) {
-      responseData = municipalitiesCache.get(cacheKey)!.data;
-    } else {
-      const db = getAdminDb();
-      const snapshot = await db
-        .collection(COLLECTIONS.MUNICIPALITIES)
-        .orderBy("score", "desc")
-        .limit(pageSize)
-        .offset((page - 1) * pageSize)
-        .get();
+        const entries: LeaderboardEntry[] = snapshot.docs.map((doc, index) => ({
+          rank: (page - 1) * pageSize + index + 1,
+          municipality: {
+            id: doc.id,
+            ...doc.data(),
+            createdAt: doc.data().createdAt?.toDate(),
+            updatedAt: doc.data().updatedAt?.toDate(),
+          } as Municipality,
+          score: doc.data().score,
+          trend: "STABLE" as const,
+          previousRank: null,
+        }));
 
-      const entries: LeaderboardEntry[] = snapshot.docs.map((doc, index) => ({
-        rank: (page - 1) * pageSize + index + 1,
-        municipality: {
-          id: doc.id,
-          ...doc.data(),
-          createdAt: doc.data().createdAt?.toDate(),
-          updatedAt: doc.data().updatedAt?.toDate(),
-        } as Municipality,
-        score: doc.data().score,
-        trend: "STABLE" as const,
-        previousRank: null,
-      }));
+        const countSnapshot = await db
+          .collection(COLLECTIONS.MUNICIPALITIES)
+          .count()
+          .get();
+        const total = countSnapshot.data().count;
 
-      const countSnapshot = await db
-        .collection(COLLECTIONS.MUNICIPALITIES)
-        .count()
-        .get();
-      const total = countSnapshot.data().count;
-
-      responseData = {
-        entries,
-        lastUpdated: new Date(),
-        totalMunicipalities: total,
-      };
-
-      municipalitiesCache.set(cacheKey, { data: responseData, timestamp: now });
-    }
+        return {
+          entries,
+          lastUpdated: new Date(),
+          totalMunicipalities: total,
+        };
+      }
+    );
 
     res.json({
       success: true,
@@ -96,50 +100,54 @@ router.get("/", async (req: Request, res: Response) => {
     const { page, pageSize } = paginationSchema.parse(req.query);
     const { state, district } = req.query;
 
-    const cacheKey = `munis-${page}-${pageSize}-${state || "all"}-${district || "all"}`;
-    const now = Date.now();
-    let responseData;
+    const cacheKey = buildCacheKey([
+      "municipalities",
+      "list",
+      page,
+      pageSize,
+      String(state || "all"),
+      String(district || "all"),
+    ]);
+    const responseData = await getOrSetCachedJson(
+      cacheKey,
+      municipalityCacheTtlSeconds,
+      async () => {
+        let query = db.collection(COLLECTIONS.MUNICIPALITIES).orderBy("name");
 
-    if (municipalitiesCache.has(cacheKey) && (now - municipalitiesCache.get(cacheKey)!.timestamp < cacheExpiryMs)) {
-      responseData = municipalitiesCache.get(cacheKey)!.data;
-    } else {
-      let query = db.collection(COLLECTIONS.MUNICIPALITIES).orderBy("name");
+        if (state) {
+          query = query.where("state", "==", state);
+        }
+        if (district) {
+          query = query.where("district", "==", district);
+        }
 
-      if (state) {
-        query = query.where("state", "==", state);
+        const snapshot = await query
+          .limit(pageSize)
+          .offset((page - 1) * pageSize)
+          .get();
+
+        const municipalities = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+          createdAt: doc.data().createdAt?.toDate(),
+          updatedAt: doc.data().updatedAt?.toDate(),
+        }));
+
+        const countSnapshot = await db
+          .collection(COLLECTIONS.MUNICIPALITIES)
+          .count()
+          .get();
+        const total = countSnapshot.data().count;
+
+        return {
+          items: municipalities,
+          total,
+          page,
+          pageSize,
+          hasMore: (page - 1) * pageSize + municipalities.length < total,
+        };
       }
-      if (district) {
-        query = query.where("district", "==", district);
-      }
-
-      const snapshot = await query
-        .limit(pageSize)
-        .offset((page - 1) * pageSize)
-        .get();
-
-      const municipalities = snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-        createdAt: doc.data().createdAt?.toDate(),
-        updatedAt: doc.data().updatedAt?.toDate(),
-      }));
-
-      const countSnapshot = await db
-        .collection(COLLECTIONS.MUNICIPALITIES)
-        .count()
-        .get();
-      const total = countSnapshot.data().count;
-
-      responseData = {
-        items: municipalities,
-        total,
-        page,
-        pageSize,
-        hasMore: (page - 1) * pageSize + municipalities.length < total,
-      };
-
-      municipalitiesCache.set(cacheKey, { data: responseData, timestamp: now });
-    }
+    );
 
     res.json({
       success: true,

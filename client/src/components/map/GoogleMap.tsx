@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState, useEffect } from "react";
+import { useCallback, useState, useEffect, useRef } from "react";
 import {
   GoogleMap,
   useJsApiLoader,
@@ -255,6 +255,8 @@ const getTypeBadge = (type: string) => {
   );
 };
 
+const roundBoundsValue = (value: number) => Number(value.toFixed(3));
+
 export function GoogleMapComponent({
   issues,
   municipalities = [],
@@ -276,6 +278,7 @@ export function GoogleMapComponent({
   );
   const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [locationChecked, setLocationChecked] = useState(false);
+  const lastBoundsKeyRef = useRef<string | null>(null);
 
   const { isLoaded, loadError } = useJsApiLoader({
     id: "google-map-script",
@@ -309,29 +312,48 @@ export function GoogleMapComponent({
   // Determine the map center: prop > user location > default
   const mapCenter = center || userLocation || defaultCenter;
 
-  const onLoad = useCallback((map: google.maps.Map) => {
-    setMap(map);
-  }, []);
+  const emitBoundsChange = useCallback(
+    (mapInstance: google.maps.Map | null) => {
+      if (!mapInstance || !onBoundsChange) {
+        return;
+      }
+
+      const bounds = mapInstance.getBounds();
+      if (bounds) {
+        const ne = bounds.getNorthEast();
+        const sw = bounds.getSouthWest();
+        const nextBounds = {
+          north: roundBoundsValue(ne.lat()),
+          south: roundBoundsValue(sw.lat()),
+          east: roundBoundsValue(ne.lng()),
+          west: roundBoundsValue(sw.lng()),
+        };
+        const nextBoundsKey = `${nextBounds.south}:${nextBounds.north}:${nextBounds.west}:${nextBounds.east}`;
+
+        if (nextBoundsKey !== lastBoundsKeyRef.current) {
+          lastBoundsKeyRef.current = nextBoundsKey;
+          onBoundsChange(nextBounds);
+        }
+      }
+    },
+    [onBoundsChange]
+  );
+
+  const onLoad = useCallback(
+    (loadedMap: google.maps.Map) => {
+      setMap(loadedMap);
+      emitBoundsChange(loadedMap);
+    },
+    [emitBoundsChange]
+  );
 
   const onUnmount = useCallback(() => {
     setMap(null);
   }, []);
 
   const handleBoundsChanged = useCallback(() => {
-    if (map && onBoundsChange) {
-      const bounds = map.getBounds();
-      if (bounds) {
-        const ne = bounds.getNorthEast();
-        const sw = bounds.getSouthWest();
-        onBoundsChange({
-          north: ne.lat(),
-          south: sw.lat(),
-          east: ne.lng(),
-          west: sw.lng(),
-        });
-      }
-    }
-  }, [map, onBoundsChange]);
+    emitBoundsChange(map);
+  }, [emitBoundsChange, map]);
 
   if (loadError) {
     return (
@@ -368,7 +390,7 @@ export function GoogleMapComponent({
       zoom={zoom}
       onLoad={onLoad}
       onUnmount={onUnmount}
-      onBoundsChanged={handleBoundsChanged}
+      onIdle={handleBoundsChanged}
       options={mapOptions}
     >
       {/* Municipality border rectangles */}
